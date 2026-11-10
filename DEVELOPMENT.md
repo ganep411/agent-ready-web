@@ -1,11 +1,39 @@
 # 開発・検証レポート
 
+## v0.5 調達Agent
+
+### 現状確認と実装
+
+- ベースはGitHub `main` のv0.4コミット `140a1a9`。同コミットのWindows CIは成功。[GitHub Actionsの実行結果](https://github.com/ganep411/agent-ready-web/actions/runs/42752573056)
+- RESTと従来のMCP検索・見積の応答形式を維持し、MCP検索の `include_details` を追加。拡張Shopifyクエリは指定時のみ使い、ページサイズを抑えた。
+- 独立したCLIがMCP stdioで検索し、構造化された仕様と数量を比較して参考見積を取得する。日本語の定型句を決定的に解析する。自由形式の依頼や外部LLMはこのデモの対象外。
+- 仕様はバリエーションのSKU、JSONメタフィールド、明示的に対応する選択オプションから取得する。未知の仕様・在庫・価格は判定に使わず、出力に不足を明示する。
+- 操作ごとの試行回数、成功数、成功率、応答時間を実行結果に出力。注文・決済・在庫確保は行わない。
+- 実店舗での初回調達デモは `discover` が成功し、`search` が失敗した。商品取得クエリのページサイズが数値に置換されず送信される不具合を修正し、通常検索と詳細検索の送信クエリをMCP通しテストで検査する。
+
+### 検証結果
+
+| 検証 | 結果 |
+|---|---|
+| Windows / Python 3.12.14 の自動テスト | 最終コードで98件通過。従来のStarlette非推奨警告1件 |
+| Shopify HTTPモックとMCP子プロセス | 型番・単位換算・仕様不明・在庫不足・適合なし・非公開除外・見積を検証 |
+| WindowsのデモCLI | 検索と見積を各1回実行し両方成功。2個7,960 JPY |
+| v0.5 GitHub Actions | Windows 3.11 / 3.12 の設定にCLI実行を追加。GitHub上での実行は未実施 |
+| v0.5 実Shopify接続 | 2026-11-10、利用者がオンラインストアを対象に再実行して成功。3候補のうち12 Vのみ適合し、在庫18、2個8,400 JPYの参考見積を取得 |
+
+実店舗の調達デモでは、親商品ID・バリエーションID・SKUを取得し、電圧はバリエーションの選択オプションに基づいて比較した。型番と容量は未設定で `null`。24 Vと48 Vは電圧不一致で見積対象外だった。参考見積は非拘束で在庫を確保しなかった。
+この1回のMCP計測では、discover 11.27 ms、検索 2,934.17 ms、見積 931.74 msで、各1回すべて成功した。型番・容量の適合判定と在庫不足のタスク結果は模擬応答で確認済み。
+
+追加の実店舗検証では、12 Vの見積、24 Vの在庫不足、36 Vの適合なし、型番・容量の欠損を `unknown` とする4ケースが通過した。
+登録後の検証では、共通キーがない場合に実店舗の `custom.procurement_specifications`（JSON）を読むよう修正した。利用者が実店舗で再実行し、12 V・型番 `ARW-TEST-PS-12`・容量60 W・数量2で参考見積の取得に成功した。電圧一致・在庫不足・適合なしを含む4ケースがすべて通過し、`PASS: Shopify procurement scenarios` を確認した。
+代替キーの読み取りを追加した後、Windowsの関連テスト10件が通過した。
+
 ## v0.4 Shopify 接続
 
 - Shopify の Client Credentials Grant を追加。トークンはプロセス内で期限前に更新し、GraphQL の401後は1度だけ再送する。`SHOPIFY_ADMIN_TOKEN` の指定がある場合は従来方式を使う。
 - Windows / Python 3.12.14 で変更前の74件、変更後の86件がすべて通過。Shopify の応答を模擬し、REST と MCP stdio から公開状態・バリエーション・価格・在庫・通貨・参考見積を検証した。両方で Starlette の TestClient に関する非推奨警告が1件あった。
 - `pip check` と MCP クライアント例のデモ実行が成功。README の PowerShell 例は構文を確認した。
-- GitHub Actions に Windows / Python 3.11・3.12 のテスト設定を追加。GitHub 上での実行結果は未確認。
+- GitHub Actions に Windows / Python 3.11・3.12 のテスト設定を追加。v0.4の実行は成功。[GitHub Actionsの実行結果](https://github.com/ganep411/agent-ready-web/actions/runs/42752573056)
 - 2026-11-10、利用者が Windows PowerShell から Shopify 開発用ストアに接続。指定 Publication の公開バリエーションを16件取得し、MCP の `discover`、`search`、`quote` が成功した。
 - DINレール直流電源の2個見積は、12 Vが8,400 JPY、24 Vが9,200 JPY。どちらも実店舗の在庫は0で、`available: false`、`binding: false`、`inventory_reserved: false` を確認した。
 - 12 Vの販売可能数を18に設定した後、実店舗につないだRESTとMCPで在庫18、2個8,400 JPY、`available: true` を確認した。24 VはRESTでも在庫0、2個9,200 JPY、`available: false`。RESTの `discover`、`search`、`quote` はHTTP 200だった。

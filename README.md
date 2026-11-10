@@ -1,4 +1,4 @@
-# Agent-ready Web SDK v0.4
+# Agent-ready Web SDK v0.5
 
 既存 EC カタログを Agent から読み取るための FastAPI + MCP SDK。
 `discover` / `search` / `quote` を提供し、**購入・決済・在庫予約は実装しません**。
@@ -182,6 +182,54 @@ foreach ($voltage in @('12 V', '24 V')) {
 テストCSVがリポジトリの親フォルダーにある場合は、認証設定済みの PowerShell で
 `.\.venv\Scripts\python.exe -m examples.verify_shopify_store` を実行すると、RESTとMCPの結果をまとめて確認できます。
 CSV外の公開サンプルは一覧に表示し、CSVの公開予定商品に欠落がなく、非公開・下書き・アーカイブの3商品が両方の検索から除外されることを確認します。
+
+## 調達AgentのE2Eデモ
+
+調達クライアントは別プロセスのSDKにMCP stdioで接続し、`discover` → `search` → `quote` を実行します。
+最小デモでは外部LLMを使わず、決められた日本語の依頼形式を解析します。
+商品名の句は「を」で終え、条件を「、」で区切り、最後に「2個見積もって」のように数量を指定します。
+型番・SKU・電圧・容量の句は任意で、数量は1〜100です。範囲や選択肢を含む未対応の条件はエラーにします。
+
+```powershell
+# Shopifyに接続しないデモ
+$env:CATALOG_ADAPTER = 'demo'
+.\.venv\Scripts\python.exe -m examples.procurement_agent 'USB-C Chargerを、型番DEMO-65、電圧20 V、容量65 W、2個見積もって'
+```
+
+実店舗で実行する場合は、上記のShopify認証と公開先を設定済みのPowerShellで、`CATALOG_ADAPTER` を `shopify` にして実行します。
+既存テストCSVの12 V品の販売可能数が18の場合、下記は8,400 JPYの参考見積を期待します。24 Vに変更すると、在庫0なら `insufficient_stock` です。
+
+```powershell
+$env:CATALOG_ADAPTER = 'shopify'
+.\.venv\Scripts\python.exe -m examples.procurement_agent 'DINレール直流電源を、電圧12 V、2個見積もって'
+```
+
+候補ごとの価格・通貨・在庫・親商品ID・バリエーションIDと、検索・見積を受信したUTC時刻を出力します。
+既知の仕様がすべて一致し、数量と価格を確認できた候補について、通貨ごとに単価を比較し、合計で最大3件の参考見積を取ります。
+比較対象は検索結果の先頭100件までです。件数上限は `search_truncated` で明示します。
+`no_match` は適合候補なし、`insufficient_stock` は確認できた適合候補の在庫不足、`unknown` は適合判定に必要な情報の不足を示します。
+注文・決済・在庫確保は実行しません。
+
+実行結果の `metrics` には操作ごとの試行回数、成功回数、成功率、合計応答時間（ms）が入ります。
+成功率はMCP呼び出しの成功率で、商品が見つかった割合とは別です。呼び出しが0件の場合は `null` です。
+計測には依頼文、認証情報、Shopifyの応答本文を記録しません。
+
+### 調達属性の共通スキーマ
+
+既存RESTと通常のMCP検索は従来の形式です。MCPの `search` に `include_details: true` を指定すると、次の項目を追加します。
+
+| 項目 | 内容・Shopifyの取得元 |
+|---|---|
+| `product_id` / `variant_id` | 親商品のGIDとバリエーションのGID。従来の `id` と見積の入力IDは引き続きバリエーションID |
+| `sku` | バリエーションの `sku` |
+| `mpn` | メーカー型番。バリエーションのJSONメタフィールドの `mpn` |
+| `attributes.voltage` / `attributes.capacity` | `{value, unit, source}`。単位付きのメタフィールドまたは、該当する名前の選択オプション |
+
+バリエーションにJSON型の `procurement.specifications` を設定すると、たとえば `{"mpn":"PS-12","voltage":"12 V","capacity":"60 W"}` を取得できます。
+このフィールドが存在しない場合は、Shopify管理画面で作成された `custom.procurement_specifications` も読み取ります。両方が存在する場合は `procurement.specifications` を優先します。
+電圧・容量のキーがメタフィールドにない場合は、「電圧」「出力電圧」「容量」「定格容量」または英語の `Voltage` / `Capacity` を取得元にします。
+`mV`、`mAh`、`mWh` はそれぞれ `V`、`Ah`、`Wh` に換算します。容量は `Ah`、`Wh`、`W`、`GB`、`MB` の同じ単位内で比較します。
+説明文・商品名・SKUから型番や仕様を補完しません。欠損や無効値は `null` で返し、判定結果は `unknown` になります。[Shopify ProductVariant](https://shopify.dev/docs/api/admin-graphql/2026-10/objects/ProductVariant) · [Shopify Metafield](https://shopify.dev/docs/api/admin-graphql/latest/objects/Metafield)
 
 ## セキュリティ・運用上の範囲
 

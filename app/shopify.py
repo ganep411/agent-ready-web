@@ -8,6 +8,7 @@ from time import monotonic
 
 import httpx
 
+from .specifications import shopify_details
 
 class ShopifyError(RuntimeError):
     pass
@@ -134,7 +135,7 @@ class ShopifyAdapter:
                         partial = payload.get("data")
                         for error in errors:
                             path = error.get("path")
-                            if not isinstance(partial, dict) or not isinstance(path, list) or not path or path[-1] not in {"price", "inventoryQuantity", "inventoryItem", "tracked", "currencyCode"}:
+                            if not isinstance(partial, dict) or not isinstance(path, list) or not path or path[-1] not in {"price", "inventoryQuantity", "inventoryItem", "tracked", "currencyCode", "procurement", "customProcurement"}:
                                 raise ShopifyError(_graphql_error(error))
                             try:
                                 parent = partial
@@ -179,22 +180,29 @@ class ShopifyAdapter:
         seen.add(cursor)
         return cursor
 
-    def list_products(self):
-        from .main import Product
+    def list_procurement_products(self):
+        return self.list_products(include_details=True)
+
+    def list_products(self, *, include_details=False):
+        from .main import ProcurementProduct, Product
         if not self.publication_id:
             raise ShopifyError("SHOPIFY_PUBLICATION_ID is required")
-        fields = 'pageInfo { hasNextPage endCursor } nodes { id title price inventoryQuantity inventoryItem { tracked } }'
-        query = '''query Catalog($cursor: String, $publication: ID!) {
+        details_fields = ''' sku selectedOptions { name value }
+            procurement: metafield(namespace: "procurement", key: "specifications") { type value }
+            customProcurement: metafield(namespace: "custom", key: "procurement_specifications") { type value }''' if include_details else ""
+        fields = 'pageInfo { hasNextPage endCursor } nodes { id title price inventoryQuantity inventoryItem { tracked }' + details_fields + ' }'
+        page_size, first_variants, next_variants = (5, 10, 50) if include_details else (20, 20, 100)
+        query = ('''query Catalog($cursor: String, $publication: ID!) {
           shop { currencyCode }
-          products(first: 20, after: $cursor, query: "status:active") {
+          products(first: PAGE_SIZE, after: $cursor, query: "status:active") {
             pageInfo { hasNextPage endCursor }
             nodes { id title description status publishedOnPublication(publicationId: $publication)
-              variants(first: 20) { ''' + fields + ''' } }
+              variants(first: FIRST_VARIANTS) { ''' + fields + ''' } }
           }
-        }'''
-        variant_query = '''query Variants($id: ID!, $cursor: String) {
-          product(id: $id) { variants(first: 100, after: $cursor) { ''' + fields + ''' } }
-        }'''
+        }''').replace("PAGE_SIZE", str(page_size)).replace("FIRST_VARIANTS", str(first_variants))
+        variant_query = ('''query Variants($id: ID!, $cursor: String) {
+          product(id: $id) { variants(first: NEXT_VARIANTS, after: $cursor) { ''' + fields + ''' } }
+        }''').replace("NEXT_VARIANTS", str(next_variants))
         products, seen, cursor = [], set(), None
         try:
             with httpx.Client(timeout=self.timeout, transport=self.transport, follow_redirects=False) as client:
@@ -222,9 +230,11 @@ class ShopifyAdapter:
                                 elif stock < 0:
                                     stock = 0
                                 title = variant["title"]
-                                products.append(Product(id=variant["id"], name=item["title"] + (" / " + title if title != "Default Title" else ""),
-                                                        description=item.get("description") or "", price=price if currency else None,
-                                                        currency=currency, stock=stock))
+                                values = dict(id=variant["id"], name=item["title"] + (" / " + title if title != "Default Title" else ""),
+                                              description=item.get("description") or "", price=price if currency else None,
+                                              currency=currency, stock=stock)
+                                products.append(ProcurementProduct(**values, **shopify_details(item, variant))
+                                                if include_details else Product(**values))
                             variant_cursor = self._next(variants, variant_seen)
                             if variant_cursor is None:
                                 break

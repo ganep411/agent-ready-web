@@ -52,9 +52,11 @@ def create_mcp(app=None):
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     def search(q: Annotated[str, Field(max_length=200)] = "",
-               limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 20) -> dict:
-        """Search published product variants; null price/stock means unknown."""
-        return invoke("search", q=q, limit=limit)
+               limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 20,
+               include_details: Annotated[bool, Field(strict=True)] = False) -> dict:
+        """Search published variants. Opt in to procurement IDs and attributes; null means unknown."""
+        operation = "procurement_search" if include_details else "search"
+        return invoke(operation, q=q, limit=limit)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     def quote(product_id: Annotated[str, Field(min_length=1, max_length=256)],

@@ -2,7 +2,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Protocol, Annotated
+from typing import Protocol, Annotated, Literal
 from uuid import uuid4
 from types import SimpleNamespace
 
@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from .shopify import ShopifyAdapter
 from .security import Guard, audit
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 class Product(BaseModel):
     id: str
@@ -23,6 +23,22 @@ class Product(BaseModel):
     price: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False)
     currency: str | None = None
     stock: int | None = Field(default=None, ge=0)  # None = unknown, not zero
+
+class Measurement(BaseModel):
+    value: str
+    unit: str
+    source: Literal["variant_metafield", "variant_option", "demo"]
+
+class ProcurementAttributes(BaseModel):
+    voltage: Measurement | None = None
+    capacity: Measurement | None = None
+
+class ProcurementProduct(Product):
+    product_id: str | None = None
+    variant_id: str
+    sku: str | None = None
+    mpn: str | None = None
+    attributes: ProcurementAttributes = Field(default_factory=ProcurementAttributes)
 
 class SearchResponse(BaseModel):
     items: list[Product]
@@ -55,6 +71,19 @@ class DemoAdapter:
             Product(id="sku-001", name="USB-C Charger 65W", description="Compact USB-C charger", price="3980", currency="JPY", stock=12),
             Product(id="sku-002", name="USB-C Cable 2m", description="Durable charging cable", price="1280", currency="JPY", stock=0),
             Product(id="sku-003", name="Wireless Mouse", description="Bluetooth wireless mouse", price="2480", currency="JPY", stock=8),
+        ]
+
+    def list_procurement_products(self):
+        products = self.list_products()
+        return [
+            ProcurementProduct(**product.model_dump(), product_id=f"demo-product-{index}",
+                               variant_id=product.id, sku=product.id)
+            if index != 1 else ProcurementProduct(
+                **product.model_dump(), product_id="demo-product-1", variant_id=product.id,
+                sku=product.id, mpn="DEMO-65",
+                attributes={"voltage": {"value": "20", "unit": "V", "source": "demo"},
+                            "capacity": {"value": "65", "unit": "W", "source": "demo"}})
+            for index, product in enumerate(products, start=1)
         ]
 
 def create_app(adapter: CatalogAdapter | None = None, *, api_key: str | None = None, requests_per_minute: int | None = None):
@@ -104,9 +133,15 @@ def create_app(adapter: CatalogAdapter | None = None, *, api_key: str | None = N
         audit(operation, str(response.status_code))
         return response
 
-    def catalog():
+    def catalog(include_details=False):
         try:
-            return app.state.catalog.list_products()
+            source = app.state.catalog
+            if include_details and hasattr(source, "list_procurement_products"):
+                return source.list_procurement_products()
+            products = source.list_products()
+            if include_details:
+                return [ProcurementProduct(**product.model_dump(), variant_id=product.id) for product in products]
+            return products
         except Exception:
             raise HTTPException(status_code=502, detail="Catalog temporarily unavailable") from None
 
@@ -129,6 +164,12 @@ def create_app(adapter: CatalogAdapter | None = None, *, api_key: str | None = N
         items = [p for p in catalog() if needle in (p.name + " " + p.description).casefold()]
         return SearchResponse(items=items[:limit], total=len(items))
 
+    def procurement_search(q, limit):
+        needle = q.casefold().strip()
+        items = [p for p in catalog(include_details=True)
+                 if any(needle in value.casefold() for value in (p.name, p.description, p.sku or "", p.mpn or ""))]
+        return {"items": [p.model_dump(mode="json") for p in items[:limit]], "total": len(items)}
+
     @app.post("/quote", response_model=QuoteResponse)
     def quote(request: QuoteRequest):
         product = next((p for p in catalog() if p.id == request.product_id), None)
@@ -139,7 +180,8 @@ def create_app(adapter: CatalogAdapter | None = None, *, api_key: str | None = N
             unit_price=product.price, total_price=product.price * request.quantity if product.price is not None else None, currency=product.currency,
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
             terms={"pricing": "Indicative only; taxes, shipping and discounts may differ at checkout", "inventory": "Not reserved", "availability": "null means inventory unknown", "unknown_values": "null price or currency means unknown"})
-    app.state.operations = SimpleNamespace(discover=discover, search=search, quote=quote)
+    app.state.operations = SimpleNamespace(discover=discover, search=search, quote=quote,
+                                           procurement_search=procurement_search)
     return app
 
 app = create_app()

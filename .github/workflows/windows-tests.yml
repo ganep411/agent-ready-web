@@ -23,3 +23,11 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m pip check
       - run: python -m pytest -q
+      - name: Run the procurement CLI against the demo catalog
+        shell: pwsh
+        run: |
+          $env:CATALOG_ADAPTER = 'demo'
+          $result = python -m examples.procurement_agent 'USB-C Chargerを、型番DEMO-65、電圧20 V、容量65 W、2個見積もって' | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $result.status -ne 'quoted' -or $result.reference_quotes[0].total_price -ne '7960') {
+            throw 'Procurement CLI smoke test failed'
+          }
