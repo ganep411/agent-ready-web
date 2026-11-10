@@ -1,4 +1,19 @@
-# v0.3 開発・検証レポート
+# 開発・検証レポート
+
+## v0.4 Shopify 接続
+
+- Shopify の Client Credentials Grant を追加。トークンはプロセス内で期限前に更新し、GraphQL の401後は1度だけ再送する。`SHOPIFY_ADMIN_TOKEN` の指定がある場合は従来方式を使う。
+- Windows / Python 3.12.14 で変更前の74件、変更後の86件がすべて通過。Shopify の応答を模擬し、REST と MCP stdio から公開状態・バリエーション・価格・在庫・通貨・参考見積を検証した。両方で Starlette の TestClient に関する非推奨警告が1件あった。
+- `pip check` と MCP クライアント例のデモ実行が成功。README の PowerShell 例は構文を確認した。
+- GitHub Actions に Windows / Python 3.11・3.12 のテスト設定を追加。GitHub 上での実行結果は未確認。
+- 2026-11-10、利用者が Windows PowerShell から Shopify 開発用ストアに接続。指定 Publication の公開バリエーションを16件取得し、MCP の `discover`、`search`、`quote` が成功した。
+- DINレール直流電源の2個見積は、12 Vが8,400 JPY、24 Vが9,200 JPY。どちらも実店舗の在庫は0で、`available: false`、`binding: false`、`inventory_reserved: false` を確認した。
+- 12 Vの販売可能数を18に設定した後、実店舗につないだRESTとMCPで在庫18、2個8,400 JPY、`available: true` を確認した。24 VはRESTでも在庫0、2個9,200 JPY、`available: false`。RESTの `discover`、`search`、`quote` はHTTP 200だった。
+- 初回は Point of Sale を参照していたため、POSで公開中の卓上デジタルマルチメーターが検索に含まれた。Publicationをオンラインストアに切り替えた後のREST検証では、CSVの公開予定15バリエーションすべてとCSV外のサンプル22バリエーションを取得した。非公開・下書き・アーカイブの商品はいずれも検索対象外で、12 Vと24 Vの在庫と参考見積も期待値どおりだった。
+- 2026-11-10、オンラインストアのPublicationを指定した実店舗で `examples.verify_shopify_store` を実行し、`PASS: Shopify REST and MCP checks` を確認した。12 Vと24 Vの検索・見積がRESTとMCPで一致し、非公開・下書き・アーカイブの3商品が両方の検索から除外された。[実店舗確認の手順](README.md#開発用ストアでの確認)
+- 診断追加後の Windows / Python 3.12.14 の自動テストは89件通過、同じ非推奨警告が1件。
+
+## v0.3 開発・検証レポート
 
 2026-11-10（日本時間）
 

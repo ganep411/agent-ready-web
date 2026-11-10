@@ -3,6 +3,8 @@ import re
 import math
 import time
 from decimal import Decimal, InvalidOperation
+from threading import Lock
+from time import monotonic
 
 import httpx
 
@@ -11,32 +13,108 @@ class ShopifyError(RuntimeError):
     pass
 
 
+def _graphql_error(error):
+    extensions = error.get("extensions") or {}
+    code = extensions.get("code")
+    details = []
+    if code in ("ACCESS_DENIED", "MAX_COST_EXCEEDED", "SHOP_INACTIVE",
+                "INTERNAL_SERVER_ERROR", "undefinedField", "argumentNotAccepted",
+                "variableMismatch", "variableRequiresValidType", "invalidValue"):
+        details.append(code)
+    path = error.get("path")
+    field = path[-1] if isinstance(path, list) and path else extensions.get("fieldName")
+    if field in ("shop", "currencyCode", "products", "product", "status", "description",
+                 "publishedOnPublication", "variants", "price", "inventoryQuantity", "inventoryItem", "tracked"):
+        details.append(field)
+    message = error.get("message")
+    if code == "ACCESS_DENIED" and isinstance(message, str):
+        details.extend(scope for scope in ("read_products", "read_inventory", "read_publications", "read_product_listings")
+                       if scope in message)
+    return "Shopify GraphQL request failed" + (f" ({', '.join(details)})" if details else "")
+
+
+class _ClientCredentials:
+    def __init__(self, url, client_id, client_secret):
+        self._url = url
+        self._form = {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+        self._lock = Lock()
+        self._cached = None
+
+    def get(self, client, rejected=None):
+        with self._lock:
+            if rejected is not None and self._cached is rejected:
+                self._cached = None
+            if self._cached and monotonic() < self._cached[1]:
+                return self._cached
+
+            started = monotonic()
+            try:
+                response = client.post(self._url, data=self._form)
+                response.raise_for_status()
+                payload = response.json()
+                token, ttl = payload["access_token"], payload["expires_in"]
+                if (not isinstance(token, str) or not token or not token.isascii()
+                        or any(not 33 <= ord(c) <= 126 for c in token)
+                        or type(ttl) is not int or ttl <= 0):
+                    raise ValueError
+                refresh_at = started + ttl - min(60, ttl / 10)
+                if started + ttl <= monotonic():
+                    raise ValueError
+            except httpx.HTTPStatusError as exc:
+                raise ShopifyError(f"Shopify token request failed (HTTP {exc.response.status_code})") from None
+            except (httpx.HTTPError, ValueError, KeyError, TypeError, OverflowError):
+                raise ShopifyError("Shopify token request failed") from None
+
+            # The tuple identity distinguishes generations, even if Shopify returns the same token.
+            self._cached = (token, refresh_at)
+            return self._cached
+
+
 class ShopifyAdapter:
-    def __init__(self, shop, token, api_version="2026-10", transport=None,
-                 publication_id=None, timeout=12, max_retries=3, sleep=time.sleep):
+    def __init__(self, shop, token=None, api_version="2026-10", transport=None,
+                 publication_id=None, timeout=12, max_retries=3, sleep=time.sleep, *,
+                 client_id=None, client_secret=None):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", shop):
             raise ValueError("SHOPIFY_SHOP must be a *.myshopify.com hostname")
         if not re.fullmatch(r"20\d{2}-(01|04|07|10)", api_version):
             raise ValueError("Invalid Shopify API version")
-        if not token or any(c in token for c in '\r\n'):
+        if token and any(c in token for c in '\r\n'):
             raise ValueError("Invalid Shopify token")
+        if not token and not (client_id and client_secret):
+            raise ValueError("Set SHOPIFY_ADMIN_TOKEN or both SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET")
         if publication_id is not None and not re.fullmatch(r"gid://shopify/Publication/\d+", publication_id):
             raise ValueError("Invalid publication ID")
         if not 0 <= max_retries <= 5 or timeout <= 0:
             raise ValueError("Invalid request limits")
         self.url = f"https://{shop}/admin/api/{api_version}/graphql.json"
         self._token = token
+        self._credentials = None if token else _ClientCredentials(
+            f"https://{shop}/admin/oauth/access_token", client_id, client_secret)
         self.publication_id = publication_id
         self.transport, self.timeout = transport, timeout
         self.max_retries, self.sleep = max_retries, sleep
 
     def _request(self, client, query, variables):
+        refreshed = False
+        body = {"query": query, "variables": variables}
         for attempt in range(self.max_retries + 1):
             delay = min(2 ** attempt, 10)
             retry = False
             try:
-                response = client.post(self.url, headers={"X-Shopify-Access-Token": self._token},
-                                       json={"query": query, "variables": variables})
+                if self._credentials is None:
+                    token = self._token
+                else:
+                    lease = self._credentials.get(client)
+                    token = lease[0]
+                response = client.post(self.url, headers={"X-Shopify-Access-Token": token}, json=body)
+                if response.status_code == 401 and self._credentials is not None and not refreshed:
+                    refreshed = True
+                    token, _ = self._credentials.get(client, rejected=lease)
+                    response = client.post(self.url, headers={"X-Shopify-Access-Token": token}, json=body)
                 retry = response.status_code == 429 or response.status_code in (500, 502, 503, 504)
                 if retry:
                     try:
@@ -57,7 +135,7 @@ class ShopifyAdapter:
                         for error in errors:
                             path = error.get("path")
                             if not isinstance(partial, dict) or not isinstance(path, list) or not path or path[-1] not in {"price", "inventoryQuantity", "inventoryItem", "tracked", "currencyCode"}:
-                                raise ShopifyError("Shopify GraphQL request failed")
+                                raise ShopifyError(_graphql_error(error))
                             try:
                                 parent = partial
                                 for segment in path[:-1]:
@@ -79,6 +157,8 @@ class ShopifyAdapter:
                         delay = min(max(delay, (throttle.get("requestedQueryCost", 0) - state.get("currentlyAvailable", 0)) / rate), 60)
             except (httpx.TimeoutException, httpx.NetworkError):
                 retry = True
+            except httpx.HTTPStatusError as exc:
+                raise ShopifyError(f"Shopify GraphQL request failed (HTTP {exc.response.status_code})") from None
             except (httpx.HTTPError, ValueError, TypeError, AttributeError):
                 raise ShopifyError("Shopify upstream request failed") from None
             if not retry or attempt == self.max_retries:

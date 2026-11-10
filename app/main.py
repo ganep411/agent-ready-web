@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field, ConfigDict
 from .shopify import ShopifyAdapter
 from .security import Guard, audit
 
+VERSION = "0.4.0"
+
 class Product(BaseModel):
     id: str
     name: str
@@ -56,19 +58,21 @@ class DemoAdapter:
         ]
 
 def create_app(adapter: CatalogAdapter | None = None, *, api_key: str | None = None, requests_per_minute: int | None = None):
-    app = FastAPI(title="Agent-ready Web SDK MVP", version="0.3.0")
+    app = FastAPI(title="Agent-ready Web SDK MVP", version=VERSION)
     if adapter is None:
         mode = os.getenv("CATALOG_ADAPTER", "demo")
         if mode == "demo":
             adapter = DemoAdapter()
         elif mode == "shopify":
             shop, token = os.getenv("SHOPIFY_SHOP"), os.getenv("SHOPIFY_ADMIN_TOKEN")
-            if not shop or not token:
-                raise RuntimeError("SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN are required")
+            if not shop:
+                raise RuntimeError("SHOPIFY_SHOP is required")
             if not os.getenv("SHOPIFY_PUBLICATION_ID"):
                 raise RuntimeError("SHOPIFY_PUBLICATION_ID is required")
             adapter = ShopifyAdapter(shop, token, api_version=os.getenv("SHOPIFY_API_VERSION", "2026-10"),
-                                     publication_id=os.getenv("SHOPIFY_PUBLICATION_ID"))
+                                     publication_id=os.getenv("SHOPIFY_PUBLICATION_ID"),
+                                     client_id=os.getenv("SHOPIFY_CLIENT_ID"),
+                                     client_secret=os.getenv("SHOPIFY_CLIENT_SECRET"))
         else:
             raise RuntimeError("Unknown CATALOG_ADAPTER")
     api_key = api_key if api_key is not None else os.getenv("AGENT_API_KEY")
@@ -112,7 +116,7 @@ def create_app(adapter: CatalogAdapter | None = None, *, api_key: str | None = N
 
     @app.get("/discover")
     def discover():
-        return {"service_id": "agent-ready-store", "version": "0.3.0", "capabilities": [
+        return {"service_id": "agent-ready-store", "version": VERSION, "capabilities": [
             {"name": "discover", "method": "GET", "path": "/discover"},
             {"name": "search", "method": "GET", "path": "/search"},
             {"name": "quote", "method": "POST", "path": "/quote"}],

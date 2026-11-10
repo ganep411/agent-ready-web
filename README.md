@@ -1,8 +1,8 @@
-# Agent-ready Web SDK v0.3
+# Agent-ready Web SDK v0.4
 
 既存 EC カタログを Agent から読み取るための FastAPI + MCP SDK。
 `discover` / `search` / `quote` を提供し、**購入・決済・在庫予約は実装しません**。
-Python 3.11 以上（このクラウドでの検証は 3.12）。
+Python 3.11 以上。
 
 ## Windows / PowerShell で起動
 
@@ -39,16 +39,19 @@ API の入力エラーは422、認証エラーは401、制限超過は429、カ�
 ## Shopify 店舗への接続
 
 店舗所有者が承認したアプリの **Admin GraphQL API** を使用します。
-Shopify のアプリ管理画面で読み取りスコープ `read_products`、`read_inventory`、
-`read_publications` を許可し、店舗にインストールして有効な Admin アクセストークンを取得します。
-アプリの認証方式に応じてトークン更新・ローテーションは運用側で行ってください。
-この SDK は OAuth インストールやトークン発行・更新を行いません。書き込みスコープは不要です。
+
+1. [Shopify Dev Dashboard](https://dev.shopify.com/dashboard) の **Stores → Create store → Dev** で開発用ストアを作成します。既存の開発用ストアを使う場合は、アプリと同じ組織に表示されることを確認します。[開発用ストアの作成手順](https://shopify.dev/docs/apps/build/stores/development-stores)
+2. 同じ組織で **Apps → Create app → Start from Dev Dashboard** を選びます。**Versions** で `read_products`、`read_inventory`、`read_publications` を指定したバージョンを **Release** します。**Install app** から開発用ストアを選び、読み取り権限を承認します。インストール後に権限を変更した場合は、店舗管理画面で新しい権限を承認します。[アプリ作成とインストール](https://shopify.dev/docs/apps/build/dev-dashboard/create-apps-using-dev-dashboard)
+3. 店舗管理画面の **商品管理 → インポート** で `shopify_test_products.csv` を読み込みます。公開7商品と非公開・下書き・アーカイブ各1商品を確認します。商品CSVの在庫数は単一ロケーション向けです。複数ロケーションの場合は在庫CSVで数量を設定します。JPYで検証する場合はストア基本通貨をJPYに設定します。[商品CSV仕様](https://help.shopify.com/ja/manual/products/import-export/using-csv)
+4. アプリの **Settings → Credentials** で Client ID と Client secret を確認します。下記の PowerShell の入力欄か、組織で承認済みの秘密管理ツールから渡します。[Shopifyの認証手順](https://shopify.dev/docs/apps/build/authentication-authorization/client-credentials-grant)
+
+バージョン作成時に App URL の入力を求められた場合は、Shopify が案内する `https://shopify.dev/apps/default-app-home` を使用できます。
 
 承認済み Admin GraphQL エクスプローラー等で次を実行し、対象販売チャネルの Publication ID を確認します。
 
 ```graphql
 query {
-  publications(first: 20) {
+  publications(first: 20, catalogType: APP) {
     nodes { id name }
     pageInfo { hasNextPage endCursor }
   }
@@ -64,15 +67,27 @@ $env:CATALOG_ADAPTER = 'shopify'
 $env:SHOPIFY_SHOP = 'your-store.myshopify.com'
 $env:SHOPIFY_PUBLICATION_ID = 'gid://shopify/Publication/123456789'
 $env:SHOPIFY_API_VERSION = '2026-10'
-# SHOPIFY_ADMIN_TOKEN と AGENT_API_KEY は秘密管理ツール等から環境へ注入してください。
-# トークン値をコマンド履歴に直接書かないでください。
+$env:AGENT_API_KEY = (& .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))")
+# Client Credentials Grant を選ぶ場合は、現在のセッションの固定トークン設定を解除します。
+Remove-Item Env:SHOPIFY_ADMIN_TOKEN -ErrorAction SilentlyContinue
+$env:SHOPIFY_CLIENT_ID = [System.Net.NetworkCredential]::new('', (Read-Host 'Shopify Client ID' -AsSecureString)).Password
+$env:SHOPIFY_CLIENT_SECRET = [System.Net.NetworkCredential]::new('', (Read-Host 'Shopify Client secret' -AsSecureString)).Password
+# 確認コマンド用に同じ設定を引き継ぐ PowerShell を開きます。
+Start-Process powershell.exe -WorkingDirectory (Get-Location).Path
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
+
+`SHOPIFY_ADMIN_TOKEN` を使う場合は、上の Client ID / Client secret の入力2行を
+`$env:SHOPIFY_ADMIN_TOKEN = [System.Net.NetworkCredential]::new('', (Read-Host 'Shopify Admin token' -AsSecureString)).Password`
+に置き換えます。両方式を設定した場合は固定トークンが優先されます。固定トークンのローテーションは運用側で行います。
+認証情報は現在のセッションとその子プロセスに渡ります。チャット、コマンド履歴、リポジトリ、共有設定には記載せず、検証後は関連する PowerShell を閉じます。
 
 `SHOPIFY_SHOP` は正確な `*.myshopify.com` のホスト名のみです。
 接続先は `https://<shop>/admin/api/<version>/graphql.json`。
 TLS 検証は有効で、リダイレクトへトークンを転送しません。
-トークンはサーバーのプロセスメモリー内でのみ使用し、レスポンス・監査ログに含めません。
+Client Credentials Grant は初回のカタログ取得時に同じ店舗の `/admin/oauth/access_token` でトークンを取得します。
+Shopify の `expires_in` に従い、最大60秒前に更新します。同一プロセス内の並行リクエストでトークンを共有します。
+トークンと認証情報はレスポンス・監査ログに含めません。
 ネットワーク制限のある環境では、対象店舗のホストへの HTTPS を許可してください。
 
 - `ACTIVE` かつ指定 Publication の `publishedOnPublication == true` の商品のみを返します。
@@ -86,7 +101,8 @@ TLS 検証は有効で、リダイレクトへトークンを転送しません�
 - `quote` は毎回カタログを取得した時点の参考値で、有効期限5分、非拘束・予約なしです。
 - HTTPタイムアウトは各通信フェーズ12秒、ネットワークエラー・429・一時的5xx・GraphQL THROTTLED は最大3回再試行。
   Retry-After と GraphQL の復元レートを考慮し、待機は1回最大60秒。
-  401・権限エラー・不正レスポンスは再試行しません。価格・在庫・通貨のフィールド単位エラーで
+  Client Credentials Grant で GraphQL が401を返した場合は、新しいトークンでそのリクエストを1度だけ再送します。
+  固定トークンの401・権限エラー・不正レスポンスは再試行しません。価格・在庫・通貨のフィールド単位エラーで
   商品データが残る場合は該当値を `null` にします。それ以外の GraphQL エラーや、権限不足でクエリ全体が拒否された場合は502です。
 
 ## MCP / Agent から利用
@@ -125,9 +141,47 @@ read-only のヒントを宣言し、異常時は MCP の `isError` を返しま
 公式クライアントで3機能を順に呼ぶデモ例:
 
 ```powershell
-# デモモードで実行。Shopify の場合は検索結果のIDに見積もり対象を変更してください。
 .\.venv\Scripts\python.exe -m examples.mcp_client
 ```
+
+### 開発用ストアでの確認
+
+認証情報を設定した環境でのみ実行します。REST 側で `data_source` が `ShopifyAdapter` と表示され、検索に続いて見積が成功することを確認します。
+指定 Publication がオンラインストアの場合、今回のCSVでは公開7商品・15バリエーションが対象です。
+
+~~~powershell
+$headers = @{ Authorization = "Bearer $env:AGENT_API_KEY" }
+$base = 'http://127.0.0.1:8000'
+Invoke-RestMethod "$base/discover" -Headers $headers
+$catalog = Invoke-RestMethod "$base/search?limit=100" -Headers $headers
+$catalog.items | Format-Table id, name, price, currency, stock
+foreach ($title in @('卓上デジタルマルチメーター', '試作電流センサー', '旧型圧着工具')) {
+    $query = [uri]::EscapeDataString($title)
+    if ((Invoke-RestMethod "$base/search?q=$query" -Headers $headers).total -ne 0) {
+        throw "Unexpected publication: $title"
+    }
+}
+foreach ($voltage in @('12 V', '24 V')) {
+    $query = [uri]::EscapeDataString("DINレール直流電源 / $voltage")
+    $matchesForVariant = (Invoke-RestMethod "$base/search?q=$query" -Headers $headers).items
+    if (@($matchesForVariant).Count -ne 1) { throw "Expected one variant for $voltage" }
+    $body = @{ product_id = $matchesForVariant[0].id; quantity = 2 } | ConvertTo-Json -Compress
+    Invoke-RestMethod "$base/quote" -Method Post -Headers $headers -ContentType 'application/json' -Body $body
+    .\.venv\Scripts\python.exe -m examples.mcp_client --query "DINレール直流電源 / $voltage" --quantity 2
+    if ($LASTEXITCODE -ne 0) { throw "MCP check failed for $voltage" }
+}
+~~~
+
+| 確認項目 | 期待値 |
+|---|---|
+| 12 Vを2個 | 在庫18、単価4200、合計8400、`available: true` |
+| 24 Vを2個 | 在庫0、単価4600、合計9200、`available: false` |
+| 公開範囲 | 卓上デジタルマルチメーター、試作電流センサー、旧型圧着工具は検索対象外 |
+| 通貨・見積条件 | 店舗の基本通貨、`binding: false`、`inventory_reserved: false`、有効期限約5分 |
+
+テストCSVがリポジトリの親フォルダーにある場合は、認証設定済みの PowerShell で
+`.\.venv\Scripts\python.exe -m examples.verify_shopify_store` を実行すると、RESTとMCPの結果をまとめて確認できます。
+CSV外の公開サンプルは一覧に表示し、CSVの公開予定商品に欠落がなく、非公開・下書き・アーカイブの3商品が両方の検索から除外されることを確認します。
 
 ## セキュリティ・運用上の範囲
 
@@ -150,8 +204,10 @@ HTTP は接続元IP、MCP は stdio セッションのプロセス単位で制�
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-既存デモAPIテストを維持。既存 Shopify テストのフィクスチャは、新しい認証・公開チャネル・在庫追跡の要件に合わせています。
+GitHub Actions は push・プルリクエスト・手動実行時に Windows の Python 3.11 / 3.12 でテストします。
+CI では模擬応答を使います。Shopify の認証情報は不要です。
 Shopify は httpx モックで公開状態、1,000件超の商品、100件超のバリエーション、通貨・在庫・価格不明、
 ページング異常、タイムアウト、再試行とエラー非開示を検証します。
+Client Credentials Grant はトークン交換、期限前更新、並行アクセス、401後の再取得、失敗時の非開示を検証します。
 MCP は公式クライアントが実際の子プロセスと initialize / tools/list / tools/call を実行します。
 実店舗・Windows 実機での検証結果は [開発レポート](DEVELOPMENT.md) を参照してください。

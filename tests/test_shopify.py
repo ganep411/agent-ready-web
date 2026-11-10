@@ -1,4 +1,6 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -40,6 +42,172 @@ def client(a):
     c = TestClient(create_app(a, api_key=KEY))
     c.headers['Authorization'] = 'Bearer ' + KEY
     return c
+
+
+def credentials_adapter(handler, **kwargs):
+    return ShopifyAdapter('demo.myshopify.com', publication_id=PUB,
+                          client_id='test-client', client_secret='test-client-secret',
+                          transport=httpx.MockTransport(handler), **kwargs)
+
+
+def test_client_credentials_http_catalog(monkeypatch):
+    for name, value in {
+        'CATALOG_ADAPTER': 'shopify', 'SHOPIFY_SHOP': 'demo.myshopify.com',
+        'SHOPIFY_PUBLICATION_ID': PUB, 'SHOPIFY_CLIENT_ID': 'test-client',
+        'SHOPIFY_CLIENT_SECRET': 'test-client-secret', 'AGENT_API_KEY': KEY,
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv('SHOPIFY_ADMIN_TOKEN', raising=False)
+    calls = []
+    variants = connection([
+        {**variant('v1'), 'title': 'A'},
+        {**variant('v2'), 'title': 'B', 'inventoryQuantity': 0, 'price': '4.00'},
+    ])
+
+    def handler(request):
+        calls.append(request.url.path)
+        assert request.url.host == 'demo.myshopify.com'
+        if request.url.path == '/admin/oauth/access_token':
+            assert request.headers['Content-Type'] == 'application/x-www-form-urlencoded'
+            assert 'X-Shopify-Access-Token' not in request.headers
+            assert parse_qs(request.content.decode()) == {
+                'grant_type': ['client_credentials'], 'client_id': ['test-client'],
+                'client_secret': ['test-client-secret'],
+            }
+            return httpx.Response(200, json={'access_token': 'test-token', 'expires_in': 86400})
+        assert request.headers['X-Shopify-Access-Token'] == 'test-token'
+        assert json.loads(request.content)['variables']['publication'] == PUB
+        return httpx.Response(200, json=payload([
+            product(variants=variants),
+            product('p2', publishedOnPublication=False),
+            product('p3', status='DRAFT'),
+            product('p4', status='ARCHIVED'),
+        ]))
+
+    app = create_app()
+    app.state.catalog.transport = httpx.MockTransport(handler)
+    c = TestClient(app, headers={'Authorization': 'Bearer ' + KEY})
+    assert c.get('/discover').json()['data_source'] == 'ShopifyAdapter'
+    assert calls == []
+    items = c.get('/search', params={'q': 'notebook'}).json()['items']
+    assert [(p['id'], p['name'], p['price'], p['currency'], p['stock']) for p in items] == [
+        ('v1', 'Notebook / A', '3.50', 'JPY', 4), ('v2', 'Notebook / B', '4.00', 'JPY', 0),
+    ]
+    for id, available, total in [('v1', True, '7.00'), ('v2', False, '8.00')]:
+        quote = c.post('/quote', json={'product_id': id, 'quantity': 2}).json()
+        assert (quote['available'], quote['total_price'], quote['currency']) == (available, total, 'JPY')
+        assert not quote['binding'] and not quote['inventory_reserved']
+    assert calls.count('/admin/oauth/access_token') == 1
+
+
+def test_client_credentials_early_refresh_is_shared(monkeypatch):
+    now = 1000
+    monkeypatch.setattr('app.shopify.monotonic', lambda: now)
+    exchanges, tokens = [], []
+
+    def handler(request):
+        if request.url.path.endswith('/access_token'):
+            exchanges.append(request)
+            return httpx.Response(200, json={'access_token': f'token-{len(exchanges)}', 'expires_in': 600})
+        tokens.append(request.headers['X-Shopify-Access-Token'])
+        return httpx.Response(200, json=payload())
+
+    a = credentials_adapter(handler)
+    a.list_products()
+    now += 539
+    a.list_products()
+    now += 1
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: a.list_products(), range(12)))
+    assert tokens == ['token-1'] * 2 + ['token-2'] * 12
+    assert len(exchanges) == 2
+
+
+@pytest.mark.parametrize('second_status', [200, 401, 403])
+def test_client_credentials_401_replays_once(second_status):
+    tokens = []
+    exchanges = 0
+
+    def handler(request):
+        nonlocal exchanges
+        if request.url.path.endswith('/access_token'):
+            exchanges += 1
+            return httpx.Response(200, json={'access_token': f'token-{exchanges}', 'expires_in': 600})
+        tokens.append(request.headers['X-Shopify-Access-Token'])
+        return httpx.Response(401 if len(tokens) == 1 else second_status, json=payload())
+
+    a = credentials_adapter(handler, max_retries=0)
+    if second_status == 200:
+        assert a.list_products()
+    else:
+        with pytest.raises(ShopifyError):
+            a.list_products()
+    assert tokens == ['token-1', 'token-2'] and exchanges == 2
+
+
+@pytest.mark.parametrize('status,body', [
+    (302, {}), (401, {'message': 'test-client-secret'}),
+    (200, {'access_token': 'test-token', 'expires_in': 0}),
+    (200, {'access_token': 'test-token\r\n', 'expires_in': 600}),
+])
+def test_failed_token_exchange_is_redacted_and_retryable(status, body, caplog):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            return httpx.Response(status, json=body, headers={'Location': 'https://other.example/'})
+        if request.url.path.endswith('/access_token'):
+            return httpx.Response(200, json={'access_token': 'test-token', 'expires_in': 600})
+        return httpx.Response(200, json=payload())
+
+    a = credentials_adapter(handler)
+    message = 'Shopify token request failed'
+    if status != 200:
+        message += f' (HTTP {status})'
+    with pytest.raises(ShopifyError) as error:
+        a.list_products()
+    assert str(error.value) == message
+    assert calls == ['/admin/oauth/access_token']
+    assert a.list_products()
+    assert 'test-client-secret' not in caplog.text and 'test-token' not in caplog.text
+
+
+def test_fixed_token_takes_precedence_and_does_not_retry_401():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        assert request.headers['X-Shopify-Access-Token'] == 'shopify-secret'
+        return httpx.Response(401)
+
+    a = adapter(handler, client_id='test-client', client_secret='test-client-secret')
+    with pytest.raises(ShopifyError):
+        a.list_products()
+    assert calls == ['/admin/api/2026-10/graphql.json']
+
+
+def test_incomplete_client_credentials_fail_closed():
+    with pytest.raises(ValueError, match='SHOPIFY_CLIENT_SECRET'):
+        ShopifyAdapter('demo.myshopify.com', client_id='test-client')
+
+
+@pytest.mark.parametrize('code,path,expected', [
+    ('ACCESS_DENIED', ['products', 'nodes', 0, 'publishedOnPublication'],
+     ' (ACCESS_DENIED, publishedOnPublication, read_publications)'),
+    ('MAX_COST_EXCEEDED', None, ' (MAX_COST_EXCEEDED)'),
+    ('secret-code', ['secret-field'], ''),
+])
+def test_graphql_diagnostic_only_includes_known_labels(code, path, expected):
+    def handler(request):
+        return httpx.Response(200, json={'errors': [{
+            'message': 'secret response text, requires read_publications',
+            'path': path, 'extensions': {'code': code},
+        }]})
+
+    with pytest.raises(ShopifyError) as error:
+        adapter(handler).list_products()
+    assert str(error.value) == 'Shopify GraphQL request failed' + expected
 
 
 def test_product_and_variant_pagination():

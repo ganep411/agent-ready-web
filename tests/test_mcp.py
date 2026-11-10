@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def run_session(check, *, code=None, env=None):
     async def run():
         child_env = dict(os.environ)
-        for name in ('CATALOG_ADAPTER', 'SHOPIFY_SHOP', 'SHOPIFY_ADMIN_TOKEN', 'SHOPIFY_PUBLICATION_ID', 'AGENT_API_KEY'):
+        for name in ('CATALOG_ADAPTER', 'SHOPIFY_SHOP', 'SHOPIFY_ADMIN_TOKEN',
+                     'SHOPIFY_CLIENT_ID', 'SHOPIFY_CLIENT_SECRET', 'SHOPIFY_API_VERSION',
+                     'SHOPIFY_PUBLICATION_ID', 'AGENT_API_KEY', 'AGENT_RATE_LIMIT'):
             child_env.pop(name, None)
         child_env.update(env or {})
         parameters = StdioServerParameters(command=sys.executable,
@@ -115,3 +117,49 @@ create_mcp(create_app(adapter)).run(transport='stdio')
         result = await session.call_tool('search')
         assert result.isError and 'private-shopify-token' not in str(result)
     run_session(check, code=code, env={'AGENT_API_KEY': 'a' * 32})
+
+
+def test_mcp_shopify_client_credentials_e2e():
+    code = '''
+import httpx
+from app.main import create_app
+from app.mcp_server import create_mcp
+
+exchanges = 0
+
+def handler(request):
+    global exchanges
+    if request.url.path == '/admin/oauth/access_token':
+        exchanges += 1
+        assert exchanges == 1
+        return httpx.Response(200, json={'access_token': 'mock-token', 'expires_in': 3600})
+    assert request.headers['X-Shopify-Access-Token'] == 'mock-token'
+    page = {'hasNextPage': False}
+    variant = {'id': 'v1', 'title': '24 V', 'price': '4600', 'inventoryQuantity': 0,
+               'inventoryItem': {'tracked': True}}
+    product = {'id': 'p1', 'title': 'DC supply', 'status': 'ACTIVE', 'publishedOnPublication': True,
+               'variants': {'pageInfo': page, 'nodes': [variant]}}
+    hidden = {**product, 'id': 'p2', 'title': 'Hidden supply', 'publishedOnPublication': False}
+    return httpx.Response(200, json={'data': {'shop': {'currencyCode': 'JPY'},
+        'products': {'pageInfo': page, 'nodes': [product, hidden]}}})
+
+app = create_app()
+app.state.catalog.transport = httpx.MockTransport(handler)
+create_mcp(app).run(transport='stdio')
+'''
+
+    async def check(session):
+        assert {t.name for t in (await session.list_tools()).tools} == {'discover', 'search', 'quote'}
+        assert data(await session.call_tool('discover'))['data_source'] == 'ShopifyAdapter'
+        items = data(await session.call_tool('search', {'q': 'supply'}))['items']
+        assert len(items) == 1 and items[0]['name'] == 'DC supply / 24 V'
+        assert items[0]['stock'] == 0 and items[0]['price'] == '4600'
+        quote = data(await session.call_tool('quote', {'product_id': items[0]['id'], 'quantity': 2}))
+        assert quote['total_price'] == '9200' and quote['currency'] == 'JPY'
+        assert quote['available'] is False and not quote['binding'] and not quote['inventory_reserved']
+
+    run_session(check, code=code, env={
+        'CATALOG_ADAPTER': 'shopify', 'SHOPIFY_SHOP': 'demo.myshopify.com',
+        'SHOPIFY_PUBLICATION_ID': 'gid://shopify/Publication/1', 'SHOPIFY_CLIENT_ID': 'mock-client',
+        'SHOPIFY_CLIENT_SECRET': 'mock-secret', 'AGENT_API_KEY': 'a' * 32,
+    })
